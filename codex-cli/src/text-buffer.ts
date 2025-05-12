@@ -33,21 +33,81 @@ function clamp(v: number, min: number, max: number): number {
  *  code units so that surrogate‑pair emoji count as one "column".)
  * ---------------------------------------------------------------------- */
 
+// Cache for expensive string operations - this dramatically improves performance
+// when the same string is processed multiple times
+const codePointsCache = new Map<string, Array<string>>();
+const MAX_CACHE_SIZE = 1000;
+
 function toCodePoints(str: string): Array<string> {
+  // Use cache for strings that might be processed repeatedly
+  if (codePointsCache.has(str)) {
+    return codePointsCache.get(str)!;
+  }
+
+  let result: Array<string>;
   if (typeof Intl !== "undefined" && "Segmenter" in Intl) {
     const seg = new Intl.Segmenter();
-    return [...seg.segment(str)].map((seg) => seg.segment);
+    result = [...seg.segment(str)].map((seg) => seg.segment);
+  } else {
+    // Use Array.from for better performance than spread operator
+    result = Array.from(str);
   }
-  // [...str] or Array.from both iterate by UTF‑32 code point, handling
-  // surrogate pairs correctly.
-  return Array.from(str);
+
+  // Only cache if the string is worth caching (not too long)
+  if (str.length > 0 && str.length < 10000 && codePointsCache.size < MAX_CACHE_SIZE) {
+    codePointsCache.set(str, result);
+
+    // Prevent cache from growing too large by removing oldest entries
+    if (codePointsCache.size > MAX_CACHE_SIZE) {
+      const firstKey = codePointsCache.keys().next().value;
+      codePointsCache.delete(firstKey);
+    }
+  }
+
+  return result;
 }
 
 function cpLen(str: string): number {
+  // Optimize by avoiding full array creation for length calculation
+  if (str.length === 0) return 0;
+
+  // For ASCII-only strings, length is the same as character coun
+  // Use a faster check without regex
+  let isAsciiOnly = true;
+  for (let i = 0; i < str.length; i++) {
+    if (str.charCodeAt(i) > 127) {
+      isAsciiOnly = false;
+      break;
+    }
+  }
+
+  if (isAsciiOnly) {
+    return str.length;
+  }
+
   return toCodePoints(str).length;
 }
 
 function cpSlice(str: string, start: number, end?: number): string {
+  // Early optimization for empty strings or no-op slices
+  if (str === "" || (start === 0 && (end === undefined || end >= str.length))) {
+    return str;
+  }
+
+  // For ASCII-only strings, we can use regular string methods
+  // Use a faster check without regex
+  let isAsciiOnly = true;
+  for (let i = 0; i < str.length; i++) {
+    if (str.charCodeAt(i) > 127) {
+      isAsciiOnly = false;
+      break;
+    }
+  }
+
+  if (isAsciiOnly) {
+    return str.slice(start, end);
+  }
+
   // Slice by code‑point indices and re‑join.
   const arr = toCodePoints(str).slice(start, end);
   return arr.join("");
@@ -78,6 +138,12 @@ export default class TextBuffer {
   private scrollRow = 0;
   private scrollCol = 0;
 
+  // Cache for viewport rendering
+  private cachedViewport: Viewport | null = null;
+  private cachedVisibleLines: Array<string> | null = null;
+  private cachedScrollRow = -1;
+  private cachedScrollCol = -1;
+
   /**
    * When the user moves the caret vertically we try to keep their original
    * horizontal column even when passing through shorter lines.  We remember
@@ -92,12 +158,22 @@ export default class TextBuffer {
   /* ------------------------------------------------------------------
    *  History & clipboard
    * ---------------------------------------------------------------- */
-  private undoStack: Array<{ lines: Array<string>; row: number; col: number }> =
-    [];
-  private redoStack: Array<{ lines: Array<string>; row: number; col: number }> =
-    [];
-  private historyLimit = 100;
 
+  // Use a more memory-efficient approach for history
+  private undoStack: Array<{
+    changes: Array<{index: number, oldLine: string | null, newLine: string | null}>;
+    row: number;
+    col: number;
+  }> = [];
+
+  private redoStack: Array<{
+    changes: Array<{index: number, oldLine: string | null, newLine: string | null}>;
+    row: number;
+    col: number;
+  }> = [];
+
+  private historyLimit = 100;
+  private lastLines: Array<string> = [];
   private clipboard: string | null = null;
 
   constructor(text = "", initialCursorIdx = 0) {
@@ -105,6 +181,9 @@ export default class TextBuffer {
     if (this.lines.length === 0) {
       this.lines = [""];
     }
+
+    // Store initial state for undo operations
+    this.lastLines = [...this.lines];
 
     // No need to reset cursor on failure - class already default cursor position to 0,0
     this.setCursorIdx(initialCursorIdx);
@@ -162,8 +241,30 @@ export default class TextBuffer {
    *  History helpers
    * =================================================================== */
   private snapshot() {
+    // Instead of copying the entire lines array, store only the differences
+    const changes: Array<{index: number, oldLine: string | null, newLine: string | null}> = [];
+
+    // Find lines that were added
+    for (let i = 0; i < this.lines.length; i++) {
+      if (i >= this.lastLines.length) {
+        // This is a new line
+        changes.push({index: i, oldLine: null, newLine: this.lines[i]});
+      } else if (this.lines[i] !== this.lastLines[i]) {
+        // This line was changed
+        changes.push({index: i, oldLine: this.lastLines[i], newLine: this.lines[i]});
+      }
+    }
+
+    // Find lines that were removed
+    for (let i = this.lines.length; i < this.lastLines.length; i++) {
+      changes.push({index: i, oldLine: this.lastLines[i], newLine: null});
+    }
+
+    // Update the lastLines to the current state
+    this.lastLines = [...this.lines];
+
     return {
-      lines: this.lines.slice(),
+      changes,
       row: this.cursorRow,
       col: this.cursorCol,
     };
@@ -183,12 +284,36 @@ export default class TextBuffer {
    * Restore a snapshot and return true if restoration happened.
    */
   private restore(
-    state: { lines: Array<string>; row: number; col: number } | undefined,
+    state: {
+      changes: Array<{index: number, oldLine: string | null, newLine: string | null}>;
+      row: number;
+      col: number;
+    } | undefined,
   ): boolean {
     if (!state) {
       return false;
     }
-    this.lines = state.lines.slice();
+
+    // Apply changes in reverse order to restore previous state
+    const changes = [...state.changes];
+    changes.sort((a, b) => b.index - a.index); // Sort in reverse order by index
+
+    for (const change of changes) {
+      if (change.oldLine === null) {
+        // This line was added, so remove i
+        this.lines.splice(change.index, 1);
+      } else if (change.newLine === null) {
+        // This line was removed, so add it back
+        this.lines.splice(change.index, 0, change.oldLine);
+      } else {
+        // This line was changed, so restore old value
+        this.lines[change.index] = change.oldLine;
+      }
+    }
+
+    // Update lastLines to match current state
+    this.lastLines = [...this.lines];
+
     this.cursorRow = state.row;
     this.cursorCol = state.col;
     this.ensureCursorInRange();
@@ -231,7 +356,26 @@ export default class TextBuffer {
     // horizontal and vertical scroll positions so the cursor remains in view.
     this.ensureCursorVisible(vp);
 
-    return this.lines.slice(this.scrollRow, this.scrollRow + vp.height);
+    // Check if we can use cached resul
+    const cacheIsValid =
+      this.cachedViewport !== null &&
+      this.cachedVisibleLines !== null &&
+      this.cachedScrollRow === this.scrollRow &&
+      this.cachedScrollCol === this.scrollCol &&
+      this.cachedViewport.height === vp.height &&
+      this.cachedViewport.width === vp.width;
+
+    if (cacheIsValid) {
+      return this.cachedVisibleLines;
+    }
+
+    // Create and store the resul
+    this.cachedViewport = { ...vp };
+    this.cachedScrollRow = this.scrollRow;
+    this.cachedScrollCol = this.scrollCol;
+    this.cachedVisibleLines = this.lines.slice(this.scrollRow, this.scrollRow + vp.height);
+
+    return this.cachedVisibleLines;
   }
   getText(): string {
     return this.lines.join("\n");
@@ -252,6 +396,7 @@ export default class TextBuffer {
     this.redoStack.push(this.snapshot());
     this.restore(state);
     this.version++;
+    this.clearCaches();
     return true;
   }
 
@@ -264,6 +409,7 @@ export default class TextBuffer {
     this.undoStack.push(this.snapshot());
     this.restore(state);
     this.version++;
+    this.clearCaches();
     return true;
   }
 
@@ -293,6 +439,7 @@ export default class TextBuffer {
       cpSlice(line, 0, this.cursorCol) + ch + cpSlice(line, this.cursorCol);
     this.cursorCol += ch.length;
     this.version++;
+    this.clearCaches();
 
     dbg("insert:after", {
       cursor: this.getCursor(),
@@ -314,6 +461,7 @@ export default class TextBuffer {
     this.cursorRow += 1;
     this.cursorCol = 0;
     this.version++;
+    this.clearCaches();
 
     dbg("newline:after", {
       cursor: this.getCursor(),
@@ -345,6 +493,7 @@ export default class TextBuffer {
       this.cursorCol = newCol;
     }
     this.version++;
+    this.clearCaches();
 
     dbg("backspace:after", {
       cursor: this.getCursor(),
@@ -366,6 +515,7 @@ export default class TextBuffer {
       this.lines.splice(this.cursorRow + 1, 1);
     }
     this.version++;
+    this.clearCaches();
 
     dbg("delete:after", {
       cursor: this.getCursor(),
@@ -392,6 +542,7 @@ export default class TextBuffer {
     // Keep the prefix before the caret, discard the remainder.
     this.lines[this.cursorRow] = cpSlice(line, 0, this.cursorCol);
     this.version++;
+    this.clearCaches();
 
     dbg("deleteToLineEnd:after", {
       cursor: this.getCursor(),
@@ -418,6 +569,7 @@ export default class TextBuffer {
     this.lines[this.cursorRow] = cpSlice(line, this.cursorCol);
     this.cursorCol = 0;
     this.version++;
+    this.clearCaches();
 
     dbg("deleteToLineStart:after", {
       cursor: this.getCursor(),
@@ -482,6 +634,7 @@ export default class TextBuffer {
       cpSlice(line, 0, start) + cpSlice(line, this.cursorCol);
     this.cursorCol = start;
     this.version++;
+    this.clearCaches();
 
     dbg("deleteWordLeft:after", {
       cursor: this.getCursor(),
@@ -545,6 +698,7 @@ export default class TextBuffer {
       cpSlice(line, 0, this.cursorCol) + cpSlice(line, end);
     // caret stays in place
     this.version++;
+    this.clearCaches();
 
     dbg("deleteWordRight:after", {
       cursor: this.getCursor(),
@@ -740,6 +894,7 @@ export default class TextBuffer {
     this.cursorCol = cpLen(parts[parts.length - 1]!);
 
     this.version++;
+    this.clearCaches();
     return true;
   }
 
@@ -878,11 +1033,11 @@ export default class TextBuffer {
     // ------------------------------------------------------------------
     //  Word-wise deletions
     //
-    //  macOS (and many terminals on Linux/BSD) map the physical “Delete” key
+    //  macOS (and many terminals on Linux/BSD) map the physical "Delete" key
     //  to a *backspace* operation – emitting either the raw DEL (0x7f) byte
-    //  or setting `key.backspace = true` in Ink’s parsed event.  Holding the
+    //  or setting `key.backspace = true` in Ink's parsed event.  Holding the
     //  Option/Alt modifier therefore *also* sends backspace semantics even
-    //  though users colloquially refer to the shortcut as “⌥+Delete”.
+    //  though users colloquially refer to the shortcut as "⌥+Delete".
     //
     //  Historically we treated **modifier + Delete** as a *forward* word
     //  deletion.  This behaviour, however, diverges from the default found
@@ -973,5 +1128,10 @@ export default class TextBuffer {
       });
     }
     return this.version !== beforeVer || cursorMoved;
+  }
+
+  // Clear caches when content changes
+  private clearCaches(): void {
+    this.cachedVisibleLines = null;
   }
 }
